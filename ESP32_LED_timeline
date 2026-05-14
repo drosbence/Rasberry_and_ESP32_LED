@@ -1,0 +1,225 @@
+#include <FastLED.h>
+
+// ----------------------------
+// HARDWARE CONFIG
+// ----------------------------
+#define LED_PIN 2
+#define TOTAL_LEDS 118
+
+#define ACTIVE_LEDS_PER_SIDE (TOTAL_LEDS / 2)
+
+#define LEFT_START 0
+#define LEFT_END (ACTIVE_LEDS_PER_SIDE - 1)
+
+#define RIGHT_START ACTIVE_LEDS_PER_SIDE
+#define RIGHT_END (TOTAL_LEDS - 1)
+
+// ----------------------------
+// VISUAL CONFIG
+// ----------------------------
+#define BRIGHTNESS 180
+
+// Raspberry 100-as skálán küld:
+// 100 = 1 LED pixel
+#define POSITION_SCALE 100
+
+#define FRAME_INTERVAL_MS 16
+
+// 1 = pontos követés
+// 2 = lágyabb, de picit késik
+#define SMOOTHING_DIVIDER 1
+
+// Szélső pixel fényereje a 3 pixeles fénypr$ofilban
+#define EDGE_LEVEL 70
+
+CRGB leds[TOTAL_LEDS];
+
+// ----------------------------
+// SERIAL INPUT
+// ----------------------------
+char inputBuffer[12];
+uint8_t inputIndex = 0;
+
+int targetPos100 = 0;
+int currentPos100 = 0;
+
+unsigned long lastFrameTime = 0;
+
+// ----------------------------
+// SETUP
+// ----------------------------
+void setup() {
+  Serial.begin(115200);
+
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, TOTAL_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+
+  delay(1000);
+  FastLED.clear(true);
+
+  // Induló validáció: két vég fehér
+  leds[0] = CRGB::White;
+  leds[TOTAL_LEDS - 1] = CRGB::White;
+  FastLED.show();
+
+  delay(800);
+  FastLED.clear(true);
+}
+
+// ----------------------------
+// UTILS
+// ----------------------------
+void resetInputBuffer() {
+  inputIndex = 0;
+  inputBuffer[0] = '\0';
+}
+
+uint8_t lerp8_custom(uint8_t a, uint8_t b, uint8_t amount) {
+  return a + ((int16_t)(b - a) * amount) / 255;
+}
+
+void setWhiteSafe(int index, uint8_t level) {
+  if (index < 0 || index >= TOTAL_LEDS) return;
+  if (level == 0) return;
+
+  leds[index] = CRGB(level, level, level);
+}
+
+// ----------------------------
+// CONTINUOUS 3 PIXEL LIGHT WAVE
+// ----------------------------
+void drawContinuousThreePixelWave(
+  int baseIndex,
+  uint8_t phase,
+  int dir,
+  int minIndex,
+  int maxIndex
+) {
+  int behindIndex = baseIndex - dir;
+  int centerIndex = baseIndex;
+  int frontIndex  = baseIndex + dir;
+
+  uint8_t behindLevel = lerp8_custom(EDGE_LEVEL, 0, phase);
+  uint8_t centerLevel = lerp8_custom(255, EDGE_LEVEL, phase);
+  uint8_t frontLevel  = lerp8_custom(EDGE_LEVEL, 255, phase);
+
+  if (behindIndex >= minIndex && behindIndex <= maxIndex) {
+    setWhiteSafe(behindIndex, behindLevel);
+  }
+
+  if (centerIndex >= minIndex && centerIndex <= maxIndex) {
+    setWhiteSafe(centerIndex, centerLevel);
+  }
+
+  if (frontIndex >= minIndex && frontIndex <= maxIndex) {
+    setWhiteSafe(frontIndex, frontLevel);
+  }
+}
+
+void drawFluidIsland(int pos100) {
+  int maxPos100 = (ACTIVE_LEDS_PER_SIDE - 1) * POSITION_SCALE;
+
+  if (pos100 < 0) pos100 = 0;
+  if (pos100 > maxPos100) pos100 = maxPos100;
+
+  FastLED.clear();
+
+  int base = pos100 / POSITION_SCALE;
+  int remainder = pos100 % POSITION_SCALE;
+
+  uint8_t phase = (uint16_t)remainder * 255 / POSITION_SCALE;
+
+  // BAL OLDAL: 0 -> 58
+  int leftBase = LEFT_START + base;
+
+  drawContinuousThreePixelWave(
+    leftBase,
+    phase,
+    +1,
+    LEFT_START,
+    LEFT_END
+  );
+
+  // JOBB OLDAL: 117 -> 59
+  int rightBase = RIGHT_END - base;
+
+  drawContinuousThreePixelWave(
+    rightBase,
+    phase,
+    -1,
+    RIGHT_START,
+    RIGHT_END
+  );
+
+  FastLED.show();
+}
+
+// ----------------------------
+// SERIAL
+// ----------------------------
+void processInput() {
+  inputBuffer[inputIndex] = '\0';
+
+  int pos100 = atoi(inputBuffer);
+
+  int maxPos100 = (ACTIVE_LEDS_PER_SIDE - 1) * POSITION_SCALE;
+
+  if (pos100 < 0) pos100 = 0;
+  if (pos100 > maxPos100) pos100 = maxPos100;
+
+  targetPos100 = pos100;
+
+  resetInputBuffer();
+}
+
+void readSerialInput() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (inputIndex > 0) {
+        processInput();
+      }
+    }
+    else if (c >= '0' && c <= '9') {
+      if (inputIndex < sizeof(inputBuffer) - 1) {
+        inputBuffer[inputIndex++] = c;
+      } else {
+        resetInputBuffer();
+      }
+    }
+  }
+}
+
+// ----------------------------
+// ANIMATION
+// ----------------------------
+void animationFrame() {
+  int delta = targetPos100 - currentPos100;
+
+  if (SMOOTHING_DIVIDER <= 1) {
+    currentPos100 = targetPos100;
+  } else {
+    currentPos100 += delta / SMOOTHING_DIVIDER;
+
+    if (abs(delta) < 2) {
+      currentPos100 = targetPos100;
+    }
+  }
+
+  drawFluidIsland(currentPos100);
+}
+
+// ----------------------------
+// LOOP
+// ----------------------------
+void loop() {
+  readSerialInput();
+
+  unsigned long now = millis();
+
+  if (now - lastFrameTime >= FRAME_INTERVAL_MS) {
+    lastFrameTime = now;
+    animationFrame();
+  }
+}

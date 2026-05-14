@@ -1,0 +1,274 @@
+import time
+import threading
+import vlc
+import serial
+import sys
+import signal
+import tkinter as tk
+import os
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+VIDEO_PATH = "/home/acb/Desktop/RB_02_ripples_30_sh256.mp4"
+
+SERIAL_PORT = "/dev/ttyUSB0"   # ha kell: /dev/ttyACM0
+BAUD = 115200
+
+# ESP oldalon TOTAL_LEDS = 118
+# bal oldal: 0..58
+# jobb oldal: 117..59
+ACTIVE_LEDS_PER_SIDE = 59
+
+POSITION_SCALE = 100
+MAX_POS100 = (ACTIVE_LEDS_PER_SIDE - 1) * POSITION_SCALE  # 5800
+
+UPDATE_INTERVAL = 0.02
+
+# HyperPixel 4.0 Square touch kijelző
+SCREEN_WIDTH = 720
+SCREEN_HEIGHT = 720
+
+stop_event = threading.Event()
+player = None
+ser = None
+root = None
+
+# ----------------------------
+# SERIAL INIT
+# ----------------------------
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD, timeout=0)
+    time.sleep(2)  # ESP reset miatt
+    print("Serial connected:", SERIAL_PORT)
+except Exception as e:
+    print("Serial error:", e)
+    sys.exit(1)
+
+# ----------------------------
+# SERIAL SEND
+# ----------------------------
+last_sent = -1
+
+def send_pos100(pos100):
+    global last_sent
+
+    pos100 = max(0, min(MAX_POS100, int(pos100)))
+
+    if pos100 == last_sent:
+        return
+
+    try:
+        ser.write(f"{pos100}\n".encode("ascii"))
+        last_sent = pos100
+    except Exception as e:
+        print("Serial write error:", e)
+
+def force_send_pos100(pos100):
+    global last_sent
+    last_sent = -1
+    send_pos100(pos100)
+
+# ----------------------------
+# SAFE EXIT
+# ----------------------------
+def handle_exit(sig=None, frame=None):
+    print("Stopping system...")
+    stop_event.set()
+
+    try:
+        if ser:
+            force_send_pos100(0)
+            ser.close()
+    except:
+        pass
+
+    try:
+        if player:
+            player.stop()
+    except:
+        pass
+
+    try:
+        if root:
+            root.destroy()
+    except:
+        pass
+
+    os._exit(0)
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
+# ----------------------------
+# VLC EMBEDDED IN TKINTER
+# ----------------------------
+def start_vlc_embedded(window_id):
+    instance = vlc.Instance(
+        "--no-video-title-show",
+        "--disable-screensaver",
+        "--no-keyboard-events",
+        "--no-mouse-events",
+        "--quiet",
+        "--no-video-deco"
+    )
+
+    p = instance.media_player_new()
+    media = instance.media_new(VIDEO_PATH)
+
+    # A VLC loopoljon, ne a Python indítsa újra kézzel.
+    # Ez stabilabb többnapos futásra.
+    media.add_option(":input-repeat=65535")
+
+    p.set_media(media)
+
+    # Linux / Raspberry Pi X11
+    p.set_xwindow(window_id)
+
+    p.play()
+
+    return p
+
+def wait_ready(p):
+    for _ in range(200):
+        length = p.get_length()
+        if length and length > 0:
+            return True
+        time.sleep(0.05)
+
+    return False
+
+# ----------------------------
+# HARD RECOVERY
+# ----------------------------
+def hard_restart_player():
+    global player
+
+    print("Hard restart player")
+
+    try:
+        force_send_pos100(0)
+    except:
+        pass
+
+    try:
+        player.stop()
+    except:
+        pass
+
+    time.sleep(0.5)
+
+    try:
+        media = player.get_media()
+        player.set_media(media)
+        player.play()
+    except Exception as e:
+        print("Hard restart error:", e)
+
+# ----------------------------
+# LED SYNC LOOP
+# ----------------------------
+def sync_loop():
+    last_time_ms = -1
+    last_progress_time = time.time()
+    last_loop_reset_time = 0
+
+    while not stop_event.is_set():
+        try:
+            state = player.get_state()
+            length_ms = player.get_length()
+            current_ms = player.get_time()
+
+            if length_ms <= 0 or current_ms < 0:
+                time.sleep(0.05)
+                continue
+
+            now = time.time()
+
+            # VLC saját loop detektálás:
+            # ha az idő hirtelen visszaugrik, új kör indult.
+            if last_time_ms > 1000 and current_ms < 500 and (now - last_loop_reset_time) > 1.0:
+                print("Loop detected by time wrap")
+                force_send_pos100(0)
+                last_loop_reset_time = now
+
+            # Ha ténylegesen halad az idő, frissítjük a watchdogot.
+            if last_time_ms < 0 or abs(current_ms - last_time_ms) > 20:
+                last_progress_time = now
+
+            # Watchdog:
+            # ha 8 mp-ig nem mozdul az idő, próbáljuk újraindítani.
+            if state == vlc.State.Playing and (now - last_progress_time) > 8:
+                print("Watchdog: video time stuck")
+                hard_restart_player()
+                last_progress_time = now
+                last_time_ms = -1
+                time.sleep(0.5)
+                continue
+
+            # Ha valamiért Ended/Stopped/Error állapotba kerülne, indítsuk újra.
+            if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
+                print("VLC ended/stopped/error, restarting")
+                hard_restart_player()
+                last_progress_time = now
+                last_time_ms = -1
+                time.sleep(0.5)
+                continue
+
+            if state != vlc.State.Playing:
+                time.sleep(0.05)
+                continue
+
+            progress = current_ms / length_ms
+            progress = max(0.0, min(1.0, progress))
+
+            pos100 = int(progress * MAX_POS100)
+            send_pos100(pos100)
+
+            last_time_ms = current_ms
+
+        except Exception as e:
+            print("Sync loop error:", e)
+            time.sleep(0.5)
+
+        time.sleep(UPDATE_INTERVAL)
+
+# ----------------------------
+# TKINTER FULLSCREEN UI
+# ----------------------------
+root = tk.Tk()
+root.title("Video LED Timeline")
+
+root.configure(bg="black")
+
+# Teljes képernyő, keret nélkül.
+# Nincs egér/billentyű bind, nincs dupla kattintásos vezérlés.
+root.overrideredirect(True)
+root.attributes("-fullscreen", True)
+root.geometry(f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}+0+0")
+
+video_frame = tk.Frame(
+    root,
+    bg="black",
+    width=SCREEN_WIDTH,
+    height=SCREEN_HEIGHT,
+    cursor="none"
+)
+
+video_frame.pack_propagate(False)
+video_frame.pack(fill=tk.BOTH, expand=True)
+
+root.update_idletasks()
+root.update()
+
+player = start_vlc_embedded(video_frame.winfo_id())
+
+if not wait_ready(player):
+    print("VLC not ready")
+    handle_exit()
+
+force_send_pos100(0)
+
+threading.Thread(target=sync_loop, daemon=True).start()
+
+root.mainloop()
